@@ -1,0 +1,159 @@
+# Create custom Gazebo worlds from images, floor plans, or occupancy grid map
+
+linorobot2 includes two tools for generating Gazebo worlds from real-world sources: a floor plan image or a SLAM-generated map. Both produce a Gazebo world that reflects the actual geometry of your physical environment, so you can develop and test ROS2 applications in simulation with full confidence in the obstacle layout before deploying to the Physical Robot.
+
+---
+
+## image_to_gazebo
+
+A GUI tool that converts any floor plan or building layout image (PNG, JPG, BMP, etc.) into a ready-to-use Gazebo world. You calibrate the image's real-world scale and set the coordinate origin interactively, then the tool generates the 3D wall mesh, model SDF, and world SDF automatically.
+
+Under the hood, it traces every dark (occupied) pixel in the image and extrudes it into a 3D wall mesh exported as an STL file.
+
+### Running
+
+```bash
+ros2 run linorobot2_gazebo image_to_gazebo
+```
+
+The **Map Image Processor** window opens with a **Controls** sidebar on the left and an **Image View** canvas on the right.
+
+### Workflow
+
+Follow the steps below in order.
+
+---
+
+**1. Load Image**
+
+Click **Load Image** and select your floor plan file (PNG, JPG, JPEG, BMP, GIF, or TIFF).
+
+The file dialog opens at `linorobot2_gazebo/linorobot2_gazebo/images/` by default. Place your floor plan images there for easy access.
+
+The image is displayed on the canvas. X (red, pointing right) and Y (green, pointing up) reference axes are drawn in the bottom-left corner.
+
+---
+
+**2. Set Meters Per Pixel**
+
+This step calibrates the real-world scale of the image.
+
+1. Click **Set Meters Per Pixel**. The status bar prompts you to click two points.
+2. Click the first point on the canvas (a red dot appears).
+3. Click the second point (another red dot and a connecting line appear).
+4. A dialog asks for the real-world distance between the two points in metres. Enter the known distance and click **OK**.
+
+The resolution (metres/pixel) is calculated and shown in the **Map Info** panel.
+
+---
+
+**3. Set Origin**
+
+This step defines where the Gazebo world coordinate origin `(0, 0)` falls on the image.
+
+1. Click **Set Origin**. The status bar prompts you to click a point.
+2. Click the desired origin location on the image (e.g. a doorway, room corner, or the robot's starting position).
+
+A small circle with red (X) and green (Y) arrows is drawn at the clicked point. The computed world-frame origin `[x, y, 0.0]` is shown in the **Map Info** panel.
+
+> The origin follows the ROS `map_server` convention: the pixel you click becomes `(0, 0)` in the world frame, with Y pointing up in the image.
+
+---
+
+**4. Set Wall Height**
+
+In the **Wall Height** field (default `1.0` m), enter the desired extrusion height for the walls.
+
+---
+
+**5. Generate World**
+
+Click **Generate World**. A dialog appears with three fields:
+
+| Field | Description |
+|-------|-------------|
+| **World Name** | A human-readable name (spaces and CamelCase are converted to `snake_case`). A live preview shows the final name. |
+| **Model Directory** | Directory where the model folder will be created. Defaults to `linorobot2_gazebo/models/`. |
+| **World SDF Directory** | Directory where the world SDF file will be written. Defaults to `linorobot2_gazebo/worlds/`. |
+
+Click **Generate** (or press Enter). A progress splash is shown while the mesh is being built. When complete, a success dialog confirms the output paths.
+
+### Output Files
+
+For a world named `my_map` the following files are created:
+
+```
+linorobot2_gazebo/models/
+└── my_map/
+    ├── model.config
+    ├── my_map.sdf
+    └── meshes/
+        └── my_map.stl
+
+linorobot2_gazebo/worlds/
+└── my_map.sdf
+```
+
+### Launching the Generated World
+
+After rebuilding the workspace (or if you used `--symlink-install`), launch the simulation with:
+
+```bash
+ros2 launch linorobot2_gazebo gazebo.launch.py world_name:=my_map
+```
+
+The `world_name` argument resolves to `linorobot2_gazebo/worlds/<world_name>.sdf`, so pass the base filename without the `.sdf` extension.
+
+To use a world SDF located outside the package, pass the full path instead:
+
+```bash
+ros2 launch linorobot2_gazebo gazebo.launch.py world_path:=/absolute/path/to/my_map.sdf
+```
+
+---
+
+## create_worlds_from_maps
+
+A batch CLI tool that converts all SLAM maps in `linorobot2_navigation/maps/` into Gazebo worlds in one command. It is the non-interactive counterpart to `image_to_gazebo`, useful for keeping simulation worlds in sync after a mapping session or when maps have been updated.
+
+For each YAML file it reads the occupancy grid image, extrudes the occupied cells into a 3D wall mesh, and writes the model SDF and world SDF.
+
+### Running
+
+```bash
+ros2 run linorobot2_gazebo create_worlds_from_maps
+```
+
+The tool automatically locates `linorobot2_navigation/maps/` by searching the workspace, then writes all generated models to `linorobot2_gazebo/models/` and all world SDF files to `linorobot2_gazebo/worlds/`. No arguments are needed.
+
+### Output Files
+
+For each map YAML named `<map_name>.yaml` the following files are created:
+
+```
+linorobot2_gazebo/models/
+└── <map_name>/
+    ├── model.config
+    ├── <map_name>.sdf
+    └── meshes/
+        └── <map_name>.stl
+
+linorobot2_gazebo/worlds/
+└── <map_name>.sdf
+```
+
+### Launching a Generated World
+
+After rebuilding (or with `--symlink-install`), launch any generated world with:
+
+```bash
+ros2 launch linorobot2_gazebo gazebo.launch.py world_name:=<map_name>
+```
+
+### Typical Workflow
+
+1. Drive your Physical Robot and build a map with SLAM Toolbox (see [Mapping](07_mapping.md)).
+2. Save the map to `linorobot2_navigation/maps/`.
+3. Run `create_worlds_from_maps` to generate the Gazebo world.
+4. Rebuild the workspace and launch the world in Gazebo.
+5. Develop and test your Nav2 application with the Simulated Robot, then deploy to the Physical Robot.
