@@ -24,7 +24,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'nmpc_lead_lag_node = nmpc_controller.nmpc_lead_lag_node:main'
+            'nmpc_lead_lag_node = nmpc_controller.nmpc_lead_lag_node:main',
+            'cps_txt_publisher = nmpc_controller.cps_txt_publisher:main',
         ],
     },
 )

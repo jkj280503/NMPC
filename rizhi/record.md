@@ -94,6 +94,8 @@ cd ~/nmpc/nmpc_ws
 source install/setup.bash
 python3 src/nmpc_controller/nmpc_controller/send_test_path.py 
 
+ros2 run nmpc_controller cps_txt_publisher --ros-args   -p txt_path:=/home/jkj/nmpc/nmpc_ws/src/nmpc_controller/nmpc_controller/GPS-速度-时间格式/test_multi_vehicle_001.txt
+
 rviz2终端：
 rviz2 -d ~/experiments/rviz_nmpc_config.rviz
 
@@ -185,3 +187,7 @@ for bag in ~/nmpc/nmpc_exp/loop_cmd/tuboshu/rosbag/*; do
       --time-source clock
   fi
 done
+
+
+
+ros2 bag record   -o ~/nmpc/nmpc_exp/contrast/tuboshu/GPS/dynamic_open   /odom   /cmd_vel   /clock   /cps_trajectory   /nmpc_debug/e_t   /nmpc_debug/e_n   /nmpc_debug/e_theta   /nmpc_debug/t_ref   /nmpc_debug/goal_dist   /nmpc_debug/solve_ms   /nmpc_debug/v_cmd   /nmpc_debug/omega_cmd   /nmpc_debug/alpha   /nmpc_debug/beta   /nmpc_debug/mu   /nmpc_debug/vy

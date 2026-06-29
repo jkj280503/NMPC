@@ -3,6 +3,7 @@ from rclpy.node import Node
 from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import Twist, PoseStamped
 from std_msgs.msg import Float64
+from nmpc_interfaces.msg import CpsTrajectory
 import casadi as ca
 import numpy as np
 import math
@@ -19,7 +20,9 @@ class NMPCLeadLagNode(Node):
         self.last_path_signature = None
 
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
-        self.path_sub = self.create_subscription(Path, '/global_path', self.path_callback, 10)
+        #self.path_sub = self.create_subscription(Path, '/global_path', self.path_callback, 10)
+        self.cps_traj_sub = self.create_subscription(CpsTrajectory, '/cps_trajectory', self.cps_trajectory_callback, 10)
+        self.cps_ref_path_pub = self.create_publisher(Path, '/cps_reference_path', 10)
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.mpc_path_pub = self.create_publisher(Path, '/mpc_path', 10)
 
@@ -28,6 +31,20 @@ class NMPCLeadLagNode(Node):
         self.x_act = 0.0
         self.y_act = 0.0
         self.theta_act = 0.0
+
+        self.earth_R = 6378137.0      #地球半径
+
+        self.cps_origin_set = False    #是否已经记录CPS轨迹原点
+        self.cps_lat0 = 0.0            #设定局部坐标原点
+        self.cps_lon0 = 0.0
+        self.cps_alt0 = 0.0
+
+        self.cps_odom_x0 = 0.0         #CPS原点平移到当前/odom位置附近
+        self.cps_odom_y0 = 0.0
+        self.cps_odom_yaw0 = 0.0       #方向旋转对齐
+
+        self.align_cps_to_current_odom = True      
+        
         self.v_act = 0.0
         self.vy_act = 0.0
         self.omega_act = 0.0
@@ -126,6 +143,27 @@ class NMPCLeadLagNode(Node):
         msg = Float64()
         msg.data = float(value)
         pub.publish(msg)
+
+    def publish_cps_reference_path_for_rviz(self, x_pts, y_pts, theta_pts, t_pts):
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = "odom"
+
+        for i in range(len(x_pts)):
+            pose = PoseStamped()
+            pose.header = path_msg.header
+
+            pose.pose.position.x = float(x_pts[i])
+            pose.pose.position.y = float(y_pts[i])
+            pose.pose.position.z = 0.0
+
+            yaw = float(theta_pts[i])
+            pose.pose.orientation.z = math.sin(yaw / 2.0)
+            pose.pose.orientation.w = math.cos(yaw / 2.0)
+
+            path_msg.poses.append(pose)
+
+        self.cps_ref_path_pub.publish(path_msg)
 
     def init_casadi_solver(self):
         self.Np = 20
@@ -324,108 +362,272 @@ class NMPCLeadLagNode(Node):
         self.omega_act = msg.twist.twist.angular.z
         self.odom_ready = True
 
-    def path_callback(self, msg):
-        if len(msg.poses) < 2:
+    def gps_rad_to_local_xy(self, lat_rad, lon_rad):
+        dx_east = (lon_rad - self.cps_lon0) * self.earth_R * math.cos(self.cps_lat0)
+        dy_north = (lat_rad - self.cps_lat0) * self.earth_R
+        return dx_east, dy_north
+    
+    def local_xy_to_odom_xy(self, x_local, y_local):
+        c = math.cos(self.cps_odom_yaw0)
+        s = math.sin(self.cps_odom_yaw0)
+
+        x_odom = self.cps_odom_x0 + c * x_local - s * y_local
+        y_odom = self.cps_odom_y0 + s * x_local + c * y_local
+
+        return x_odom, y_odom
+
+    #  def path_callback(self, msg):
+    #     if len(msg.poses) < 2:
+    #         return
+
+    #     self.get_logger().info("收到带时间戳参考轨迹，直接建立时间插值...")
+
+    #     x_pts, y_pts, z_pts, theta_pts, roll_pts, t_pts = [], [], [], [], [], []
+    #     t0_sec = None
+    #     for pose_stamped in msg.poses:
+    #         x = pose_stamped.pose.position.x
+    #         y = pose_stamped.pose.position.y
+    #         z = pose_stamped.pose.position.z
+
+    #         q = pose_stamped.pose.orientation
+    #         theta = math.atan2(
+    #             2.0 * (q.w * q.z + q.x * q.y),
+    #             1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    #         )
+    #         roll = math.atan2(
+    #             2.0 * (q.w * q.x + q.y * q.z),
+    #             1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+    #         )
+
+    #         sec = pose_stamped.header.stamp.sec + pose_stamped.header.stamp.nanosec * 1e-9
+    #         if t0_sec is None:
+    #             t0_sec = sec
+    #         t_rel = sec - t0_sec
+
+    #         x_pts.append(x)
+    #         y_pts.append(y)
+    #         z_pts.append(z)
+    #         theta_pts.append(theta)
+    #         roll_pts.append(roll)
+    #         t_pts.append(t_rel)
+
+    #     x_pts = np.array(x_pts)
+    #     y_pts = np.array(y_pts)
+    #     z_pts = np.array(z_pts)
+    #     theta_pts = np.unwrap(np.array(theta_pts))
+    #     roll_pts = np.unwrap(np.array(roll_pts))
+    #     t_pts = np.array(t_pts)
+
+    #     keep = np.hstack(([True], np.diff(t_pts) > 1e-6))
+    #     x_pts = x_pts[keep]
+    #     y_pts = y_pts[keep]
+    #     z_pts = z_pts[keep]
+    #     theta_pts = theta_pts[keep]
+    #     roll_pts = roll_pts[keep]
+    #     t_pts = t_pts[keep]
+
+    #     if len(x_pts) < 2:
+    #         self.get_logger().warn("路径有效点不足，忽略本次路径")
+    #         return
+
+    #     dt = np.diff(t_pts)
+    #     dx = np.diff(x_pts)
+    #     dy = np.diff(y_pts)
+    #     dz = np.diff(z_pts)
+    #     dtheta = np.diff(theta_pts)
+
+    #     ds = np.sqrt(dx**2 + dy**2)
+    #     alpha_pts = np.zeros_like(t_pts)
+    #     alpha_pts[1:] = np.arctan2(dz, np.maximum(ds, 1e-6))
+    #     alpha_pts[0] = alpha_pts[1]
+
+    #     alpha_pts = np.clip(alpha_pts, -self.max_slope_rad, self.max_slope_rad)
+
+    #     if self.alpha_filter_window > 1 and len(alpha_pts) >= self.alpha_filter_window:
+    #         kernel = np.ones(self.alpha_filter_window) / self.alpha_filter_window
+    #         alpha_smooth = np.convolve(alpha_pts, kernel, mode='same')
+    #         half = self.alpha_filter_window // 2
+    #         alpha_smooth[:half] = alpha_pts[:half]
+    #         alpha_smooth[-half:] = alpha_pts[-half:]
+    #         alpha_pts = alpha_smooth
+
+    #     if self.use_path_roll_as_beta:
+    #         beta_pts = np.array(roll_pts, dtype=float)
+    #     else:
+    #         beta_pts = np.full_like(t_pts, self.beta_default, dtype=float)
+
+    #     beta_pts = np.clip(beta_pts, -self.max_beta_rad, self.max_beta_rad)
+
+    #     if self.beta_filter_window > 1 and len(beta_pts) >= self.beta_filter_window:
+    #         kernel = np.ones(self.beta_filter_window) / self.beta_filter_window
+    #         beta_smooth = np.convolve(beta_pts, kernel, mode='same')
+    #         half = self.beta_filter_window // 2
+    #         beta_smooth[:half] = beta_pts[:half]
+    #         beta_smooth[-half:] = beta_pts[-half:]
+    #         beta_pts = beta_smooth
+
+    #     mu_pts = np.full_like(t_pts, self.mu_nominal, dtype=float)
+    #     mu_pts = np.clip(mu_pts, self.mu_min, self.mu_max)
+
+    #     v_pts = np.zeros_like(t_pts)
+    #     omega_pts = np.zeros_like(t_pts)
+
+    #     v_pts[1:] = np.sqrt(dx**2 + dy**2) / np.maximum(dt, 1e-6)
+    #     v_pts[0] = v_pts[1]
+
+    #     omega_pts[1:] = dtheta / np.maximum(dt, 1e-6)
+    #     omega_pts[0] = omega_pts[1]
+
+    #     self.t_track = t_pts
+    #     self.t_final = float(t_pts[-1])
+
+    #     self.traj_interp = {
+    #         'x_of_t': interp1d(t_pts, x_pts, bounds_error=False, fill_value=(x_pts[0], x_pts[-1])),
+    #         'y_of_t': interp1d(t_pts, y_pts, bounds_error=False, fill_value=(y_pts[0], y_pts[-1])),
+    #         'theta_of_t': interp1d(t_pts, theta_pts, bounds_error=False, fill_value=(theta_pts[0], theta_pts[-1])),
+    #         'v_of_t': interp1d(t_pts, v_pts, bounds_error=False, fill_value=(v_pts[0], v_pts[-1])),
+    #         'omega_of_t': interp1d(t_pts, omega_pts, bounds_error=False, fill_value=(omega_pts[0], omega_pts[-1])),
+    #         'alpha_of_t': interp1d(t_pts, alpha_pts, bounds_error=False, fill_value=(alpha_pts[0], alpha_pts[-1])),
+    #         'beta_of_t': interp1d(t_pts, beta_pts, bounds_error=False, fill_value=(beta_pts[0], beta_pts[-1])),
+    #         'mu_of_t': interp1d(t_pts, mu_pts, bounds_error=False, fill_value=(mu_pts[0], mu_pts[-1])),
+    #     }
+
+    #     self.get_logger().info(
+    #         f"地形预瞄已建立: alpha_min={np.min(alpha_pts):.4f} rad, "
+    #         f"alpha_max={np.max(alpha_pts):.4f} rad, "
+    #         f"beta_min={np.min(beta_pts):.4f} rad, "
+    #         f"beta_max={np.max(beta_pts):.4f} rad, "
+    #         f"mu={self.mu_nominal:.2f}"
+    #     )
+
+    #     self.path_ready = True
+    #     self.is_initialized = False
+
+    #     self.u0_guess = np.zeros(self.nx * (self.Np + 1) + self.nu * self.Np)
+    #     self.actual_path_msg = Path()
+    #     self.actual_path_msg.header.frame_id = "odom"
+    #     self.arrival_time = None
+    #     self.total_ctrl_count = 0
+    #     self.v_sat_count = 0
+    #     self.w_sat_count = 0
+
+    def cps_trajectory_callback(self, msg):
+        if len(msg.points) < 2:
             return
 
-        self.get_logger().info("收到带时间戳参考轨迹，直接建立时间插值...")
+        if not self.odom_ready:
+            self.get_logger().warn("收到 CPS 轨迹，但 /odom 尚未就绪，暂不处理")
+            return
 
-        x_pts, y_pts, z_pts, theta_pts, roll_pts, t_pts = [], [], [], [], [], []
-        t0_sec = None
-        for pose_stamped in msg.poses:
-            x = pose_stamped.pose.position.x
-            y = pose_stamped.pose.position.y
-            z = pose_stamped.pose.position.z
+        self.get_logger().info("收到 CPS 经纬度时空轨迹，转换到 odom 坐标并建立时间插值...")
 
-            q = pose_stamped.pose.orientation
-            theta = math.atan2(
-                2.0 * (q.w * q.z + q.x * q.y),
-                1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-            )
-            roll = math.atan2(
-                2.0 * (q.w * q.x + q.y * q.z),
-                1.0 - 2.0 * (q.x * q.x + q.y * q.y)
-            )
+        lat_pts = np.array([p.latitude_rad for p in msg.points], dtype=float)
+        lon_pts = np.array([p.longitude_rad for p in msg.points], dtype=float)
+        z_raw = np.array([p.altitude_m for p in msg.points], dtype=float)
+        v_kmh = np.array([p.speed_kmh for p in msg.points], dtype=float)
+        t_pts = np.array([p.time_s for p in msg.points], dtype=float)
 
-            sec = pose_stamped.header.stamp.sec + pose_stamped.header.stamp.nanosec * 1e-9
-            if t0_sec is None:
-                t0_sec = sec
-            t_rel = sec - t0_sec
-
-            x_pts.append(x)
-            y_pts.append(y)
-            z_pts.append(z)
-            theta_pts.append(theta)
-            roll_pts.append(roll)
-            t_pts.append(t_rel)
-
-        x_pts = np.array(x_pts)
-        y_pts = np.array(y_pts)
-        z_pts = np.array(z_pts)
-        theta_pts = np.unwrap(np.array(theta_pts))
-        roll_pts = np.unwrap(np.array(roll_pts))
-        t_pts = np.array(t_pts)
-
+        # 1. 按时间去重
         keep = np.hstack(([True], np.diff(t_pts) > 1e-6))
-        x_pts = x_pts[keep]
-        y_pts = y_pts[keep]
-        z_pts = z_pts[keep]
-        theta_pts = theta_pts[keep]
-        roll_pts = roll_pts[keep]
+        lat_pts = lat_pts[keep]
+        lon_pts = lon_pts[keep]
+        z_raw = z_raw[keep]
+        v_kmh = v_kmh[keep]
         t_pts = t_pts[keep]
 
-        if len(x_pts) < 2:
-            self.get_logger().warn("路径有效点不足，忽略本次路径")
+        if len(t_pts) < 2:
+            self.get_logger().warn("CPS 轨迹有效点不足，忽略")
             return
 
+        # 2. 以第一点为 GPS 局部坐标原点
+        self.cps_lat0 = float(lat_pts[0])
+        self.cps_lon0 = float(lon_pts[0])
+        self.cps_alt0 = float(z_raw[0])
+
+        # 3. 先得到局部 ENU 坐标
+        x_local = np.zeros_like(t_pts)
+        y_local = np.zeros_like(t_pts)
+
+        for i in range(len(t_pts)):
+            x_local[i], y_local[i] = self.gps_rad_to_local_xy(
+                float(lat_pts[i]),
+                float(lon_pts[i])
+            )
+
+        # 4. 计算 CPS 轨迹首段方向
+        # dx0 = x_local[min(1, len(x_local)-1)] - x_local[0]
+        # dy0 = y_local[min(1, len(y_local)-1)] - y_local[0]
+        # gps_yaw0 = math.atan2(dy0, dx0)
+        gps_yaw0 = 0.0
+        found_heading = False
+        for j in range(1, len(x_local)):
+            dx0 = x_local[j] - x_local[0]
+            dy0 = y_local[j] - y_local[0]
+            if math.hypot(dx0, dy0) > 0.05:
+                gps_yaw0 = math.atan2(dy0, dx0)
+                found_heading = True
+                break
+
+        if not found_heading:
+            self.get_logger().warn("CPS轨迹起始段位移过小，初始方向暂用车辆当前航向")
+            gps_yaw0 = self.theta_act
+
+        # 5. 把 CPS 轨迹起点对齐到当前 odom 车辆位置
+        self.cps_odom_x0 = float(self.x_act)
+        self.cps_odom_y0 = float(self.y_act)
+
+        # 6. 把 GPS 首段方向旋转到车辆当前 odom 航向
+        self.cps_odom_yaw0 = float(self.theta_act - gps_yaw0)
+
+        # 7. ENU 坐标转 odom 坐标
+        x_pts = np.zeros_like(t_pts)
+        y_pts = np.zeros_like(t_pts)
+
+        for i in range(len(t_pts)):
+            x_pts[i], y_pts[i] = self.local_xy_to_odom_xy(
+                float(x_local[i]),
+                float(y_local[i])
+            )
+
+        z_pts = z_raw - self.cps_alt0
+
+        # 8. 轨迹航向角：由 odom 下的 x/y 计算
+        dx_grad = np.gradient(x_pts)
+        dy_grad = np.gradient(y_pts)
+        theta_pts = np.unwrap(np.arctan2(dy_grad, dx_grad))
+
+        # 9. 速度：直接使用 CPS 文件速度列
+        v_pts = v_kmh / 3.6
+        v_pts = np.clip(v_pts, self.v_min, self.v_max)
+
+        # 10. 角速度：由航向角对时间差分
         dt = np.diff(t_pts)
+        dtheta = np.diff(theta_pts)
+        omega_pts = np.zeros_like(t_pts)
+        omega_pts[1:] = dtheta / np.maximum(dt, 1e-6)
+        omega_pts[0] = omega_pts[1]
+        omega_pts = np.clip(omega_pts, self.omega_min, self.omega_max)
+
+        # 11. 坡度
         dx = np.diff(x_pts)
         dy = np.diff(y_pts)
         dz = np.diff(z_pts)
-        dtheta = np.diff(theta_pts)
-
         ds = np.sqrt(dx**2 + dy**2)
+
         alpha_pts = np.zeros_like(t_pts)
         alpha_pts[1:] = np.arctan2(dz, np.maximum(ds, 1e-6))
         alpha_pts[0] = alpha_pts[1]
-
         alpha_pts = np.clip(alpha_pts, -self.max_slope_rad, self.max_slope_rad)
 
-        if self.alpha_filter_window > 1 and len(alpha_pts) >= self.alpha_filter_window:
-            kernel = np.ones(self.alpha_filter_window) / self.alpha_filter_window
-            alpha_smooth = np.convolve(alpha_pts, kernel, mode='same')
-            half = self.alpha_filter_window // 2
-            alpha_smooth[:half] = alpha_pts[:half]
-            alpha_smooth[-half:] = alpha_pts[-half:]
-            alpha_pts = alpha_smooth
-
-        if self.use_path_roll_as_beta:
-            beta_pts = np.array(roll_pts, dtype=float)
-        else:
-            beta_pts = np.full_like(t_pts, self.beta_default, dtype=float)
-
+        # 12. 横坡暂时设 0
+        beta_pts = np.full_like(t_pts, self.beta_default, dtype=float)
         beta_pts = np.clip(beta_pts, -self.max_beta_rad, self.max_beta_rad)
 
-        if self.beta_filter_window > 1 and len(beta_pts) >= self.beta_filter_window:
-            kernel = np.ones(self.beta_filter_window) / self.beta_filter_window
-            beta_smooth = np.convolve(beta_pts, kernel, mode='same')
-            half = self.beta_filter_window // 2
-            beta_smooth[:half] = beta_pts[:half]
-            beta_smooth[-half:] = beta_pts[-half:]
-            beta_pts = beta_smooth
-
+        # 13. 附着系数暂时用默认值
         mu_pts = np.full_like(t_pts, self.mu_nominal, dtype=float)
         mu_pts = np.clip(mu_pts, self.mu_min, self.mu_max)
 
-        v_pts = np.zeros_like(t_pts)
-        omega_pts = np.zeros_like(t_pts)
-
-        v_pts[1:] = np.sqrt(dx**2 + dy**2) / np.maximum(dt, 1e-6)
-        v_pts[0] = v_pts[1]
-
-        omega_pts[1:] = dtheta / np.maximum(dt, 1e-6)
-        omega_pts[0] = omega_pts[1]
-
+        # 14. 建立插值函数，后面的 control_loop 可以继续使用
         self.t_track = t_pts
         self.t_final = float(t_pts[-1])
 
@@ -440,24 +642,24 @@ class NMPCLeadLagNode(Node):
             'mu_of_t': interp1d(t_pts, mu_pts, bounds_error=False, fill_value=(mu_pts[0], mu_pts[-1])),
         }
 
-        self.get_logger().info(
-            f"地形预瞄已建立: alpha_min={np.min(alpha_pts):.4f} rad, "
-            f"alpha_max={np.max(alpha_pts):.4f} rad, "
-            f"beta_min={np.min(beta_pts):.4f} rad, "
-            f"beta_max={np.max(beta_pts):.4f} rad, "
-            f"mu={self.mu_nominal:.2f}"
-        )
-
         self.path_ready = True
         self.is_initialized = False
-
         self.u0_guess = np.zeros(self.nx * (self.Np + 1) + self.nu * self.Np)
+
         self.actual_path_msg = Path()
         self.actual_path_msg.header.frame_id = "odom"
         self.arrival_time = None
         self.total_ctrl_count = 0
         self.v_sat_count = 0
         self.w_sat_count = 0
+
+        self.publish_cps_reference_path_for_rviz(x_pts, y_pts, theta_pts, t_pts)
+
+        self.get_logger().info(
+            f"CPS轨迹已转换: N={len(t_pts)}, "
+            f"t_final={self.t_final:.3f}s, "
+            f"v_min={np.min(v_pts):.3f}m/s, v_max={np.max(v_pts):.3f}m/s"
+        )
 
     def control_loop(self):
         if not self.path_ready or not self.odom_ready:
