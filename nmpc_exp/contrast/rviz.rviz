@@ -6,6 +6,7 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
+        - /MarkerArray1
       Splitter Ratio: 0.5
     Tree Height: 707
   - Class: rviz_common/Selection
@@ -204,6 +205,19 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /mpc_path
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MarkerArray
+      Namespaces:
+        checkpoint_labels: true
+        checkpoints: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /checkpoint_markers
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -250,25 +264,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 39.234519958496094
+      Distance: 16.051990509033203
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 13.468273162841797
-        Y: 0.5836855173110962
-        Z: -5.373283863067627
+        X: 21.065317153930664
+        Y: -2.226077079772949
+        Z: -2.301563024520874
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.3253976106643677
+      Pitch: 0.6397965550422668
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 0.14539818465709686
+      Yaw: 6.168582916259766
     Saved: ~
 Window Geometry:
   Displays:

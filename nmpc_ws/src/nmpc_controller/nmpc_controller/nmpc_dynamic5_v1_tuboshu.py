@@ -4,6 +4,7 @@ from nav_msgs.msg import Path, Odometry
 from geometry_msgs.msg import Twist, PoseStamped
 from std_msgs.msg import Float64
 from nmpc_interfaces.msg import CpsTrajectory
+from visualization_msgs.msg import Marker, MarkerArray
 import casadi as ca
 import numpy as np
 import math
@@ -85,7 +86,7 @@ class NMPCLeadLagNode(Node):
         self.checkpoint_times = None
 
         # 检查点实际通过判定半径，用于后续统计，不直接参与 NMPC
-        self.cp_arrival_radius = 0.10
+        self.cp_arrival_radius = 0.05
 
         # 记录检查点实际到达时间，后面做实验统计
         self.cp_arrival_logged = {}
@@ -145,6 +146,7 @@ class NMPCLeadLagNode(Node):
         self.beta_pub = self.create_publisher(Float64, '/nmpc_debug/beta', 10)
         self.mu_pub = self.create_publisher(Float64, '/nmpc_debug/mu', 10)
         self.vy_pub = self.create_publisher(Float64, '/nmpc_debug/vy', 10)
+        self.checkpoint_marker_pub = self.create_publisher(MarkerArray, '/checkpoint_markers', 10)
 
         self.actual_path_msg = Path()
         self.actual_path_msg.header.frame_id = "odom"
@@ -181,6 +183,66 @@ class NMPCLeadLagNode(Node):
             path_msg.poses.append(pose)
 
         self.cps_ref_path_pub.publish(path_msg)
+
+    def publish_checkpoint_markers_for_rviz(self):
+        if self.checkpoint_times is None or self.traj_interp is None:
+            return
+
+        marker_array = MarkerArray()
+        now_msg = self.get_clock().now().to_msg()
+
+        for idx, t_cp in enumerate(self.checkpoint_times):
+            x_cp = float(self.traj_interp['x_of_t'](t_cp))
+            y_cp = float(self.traj_interp['y_of_t'](t_cp))
+
+            marker = Marker()
+            marker.header.frame_id = "odom"
+            marker.header.stamp = now_msg
+            marker.ns = "checkpoints"
+            marker.id = idx
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+
+            marker.pose.position.x = x_cp
+            marker.pose.position.y = y_cp
+            marker.pose.position.z = 0.15
+            marker.pose.orientation.w = 1.0
+
+            marker.scale.x = 0.18
+            marker.scale.y = 0.18
+            marker.scale.z = 0.18
+
+            marker.color.r = 1.0
+            marker.color.g = 0.0
+            marker.color.b = 0.0
+            marker.color.a = 1.0
+
+            marker_array.markers.append(marker)
+
+            text = Marker()
+            text.header.frame_id = "odom"
+            text.header.stamp = now_msg
+            text.ns = "checkpoint_labels"
+            text.id = 1000 + idx
+            text.type = Marker.TEXT_VIEW_FACING
+            text.action = Marker.ADD
+
+            text.pose.position.x = x_cp
+            text.pose.position.y = y_cp
+            text.pose.position.z = 0.45
+            text.pose.orientation.w = 1.0
+
+            text.scale.z = 0.25
+            text.color.r = 1.0
+            text.color.g = 1.0
+            text.color.b = 1.0
+            text.color.a = 1.0
+
+            text.text = f"{t_cp:.1f}s"
+
+            marker_array.markers.append(text)
+
+        self.checkpoint_marker_pub.publish(marker_array)
 
     def init_casadi_solver(self):
         self.Np = 20
@@ -675,7 +737,8 @@ class NMPCLeadLagNode(Node):
         # 你也可以改成 [2.0, 4.0, 6.0, self.t_final]
         if self.use_checkpoint_soft_constraint:
             cp_dt = 1.0
-            self.checkpoint_times = list(np.arange(cp_dt, self.t_final + 1e-6, cp_dt))
+            cp_start = 2.0    
+            self.checkpoint_times = list(np.arange(cp_start, self.t_final + 1e-6, cp_dt))
 
             # 确保终点也作为检查点
             if len(self.checkpoint_times) == 0 or abs(self.checkpoint_times[-1] - self.t_final) > 1e-3:
@@ -697,6 +760,15 @@ class NMPCLeadLagNode(Node):
             'mu_of_t': interp1d(t_pts, mu_pts, bounds_error=False, fill_value=(mu_pts[0], mu_pts[-1])),
         }
 
+        if self.use_checkpoint_soft_constraint and self.checkpoint_times is not None:
+            self.get_logger().info("检查点列表如下：")
+            for t_cp in self.checkpoint_times:
+                x_cp = float(self.traj_interp['x_of_t'](t_cp))
+                y_cp = float(self.traj_interp['y_of_t'](t_cp))
+                self.get_logger().info(
+                    f"CP: t={t_cp:.3f}s, x={x_cp:.3f}m, y={y_cp:.3f}m"
+                )
+
         self.path_ready = True
         self.is_initialized = False
         self.u0_guess = np.zeros(self.nx * (self.Np + 1) + self.nu * self.Np)
@@ -709,6 +781,7 @@ class NMPCLeadLagNode(Node):
         self.w_sat_count = 0
 
         self.publish_cps_reference_path_for_rviz(x_pts, y_pts, theta_pts, t_pts)
+        self.publish_checkpoint_markers_for_rviz()
 
         self.get_logger().info(
             f"CPS轨迹已转换: N={len(t_pts)}, "
