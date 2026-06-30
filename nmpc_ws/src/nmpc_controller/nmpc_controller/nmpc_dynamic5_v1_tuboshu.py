@@ -73,6 +73,23 @@ class NMPCLeadLagNode(Node):
         self.ll_time_err_max = 0.8
         self.ll_K_time_v = 1.0
         self.ll_dv_max = 0.50
+
+        # 检查点软约束参数
+        self.use_checkpoint_soft_constraint = True
+
+        # 检查点权重。先不要太大，避免一开始就让速度饱和
+        self.cp_weight = 300.0
+
+        # 检查点时间，单位 s。
+        # 这里先用 None，等收到轨迹后自动生成。
+        self.checkpoint_times = None
+
+        # 检查点实际通过判定半径，用于后续统计，不直接参与 NMPC
+        self.cp_arrival_radius = 0.10
+
+        # 记录检查点实际到达时间，后面做实验统计
+        self.cp_arrival_logged = {}
+
         self.use_slope_feedforward = False
         self.ff_slope_gain = 0.0
 
@@ -259,6 +276,13 @@ class NMPCLeadLagNode(Node):
         X_ref = ca.SX.sym('X_ref', self.nx, self.Np + 1)
         U_ref = ca.SX.sym('U_ref', self.nu, self.Np)
         Terrain_ref = ca.SX.sym('Terrain_ref', self.np_terrain, self.Np)
+
+        # 新增：检查点参考
+        # 第0行：检查点x
+        # 第1行：检查点y
+        # 第2行：检查点权重，0表示该预测步没有检查点
+        CP_ref = ca.SX.sym('CP_ref', 3, self.Np + 1)
+
         x0 = ca.SX.sym('x0', self.nx)
         u_prev = ca.SX.sym('u_prev', self.nu)
 
@@ -290,6 +314,13 @@ class NMPCLeadLagNode(Node):
             J += 1.0 * v_err**2 + 0.5 * w_err**2
             J += ca.mtimes([du.T, Qdu, du])
 
+            # 检查点软约束
+            cp_x = CP_ref[0, k]
+            cp_y = CP_ref[1, k]
+            cp_w = CP_ref[2, k]
+            cp_err2 = (X[0, k] - cp_x)**2 + (X[1, k] - cp_y)**2
+            J += cp_w * cp_err2
+
             g.append(X[:, k + 1] - F_discrete(X[:, k], U[:, k], Terrain_ref[:, k]))
 
         dxN = X[0, self.Np] - X_ref[0, self.Np]
@@ -306,11 +337,20 @@ class NMPCLeadLagNode(Node):
         J += 120.0 * e_tN**2 + 150.0 * e_nN**2 + 12.0 * e_thetaN**2
         J += 6.0 * vx_errN**2 + 25.0 * vy_errN**2 + 4.0 * r_errN**2
 
+        # 终端步检查点软约束
+        cp_xN = CP_ref[0, self.Np]
+        cp_yN = CP_ref[1, self.Np]
+        cp_wN = CP_ref[2, self.Np]
+
+        cp_err2N = (X[0, self.Np] - cp_xN)**2 + (X[1, self.Np] - cp_yN)**2
+        J += cp_wN * cp_err2N
+
         opt_variables = ca.vertcat(ca.reshape(X, -1, 1), ca.reshape(U, -1, 1))
         opt_params = ca.vertcat(
             ca.reshape(X_ref, -1, 1),
             ca.reshape(U_ref, -1, 1),
             ca.reshape(Terrain_ref, -1, 1),
+            ca.reshape(CP_ref, -1, 1),
             x0,
             u_prev
         )
@@ -631,6 +671,21 @@ class NMPCLeadLagNode(Node):
         self.t_track = t_pts
         self.t_final = float(t_pts[-1])
 
+        # 自动生成检查点时间：每 1 秒一个检查点，不包括起点
+        # 你也可以改成 [2.0, 4.0, 6.0, self.t_final]
+        if self.use_checkpoint_soft_constraint:
+            cp_dt = 1.0
+            self.checkpoint_times = list(np.arange(cp_dt, self.t_final + 1e-6, cp_dt))
+
+            # 确保终点也作为检查点
+            if len(self.checkpoint_times) == 0 or abs(self.checkpoint_times[-1] - self.t_final) > 1e-3:
+                self.checkpoint_times.append(self.t_final)
+
+            self.cp_arrival_logged = {float(t): None for t in self.checkpoint_times}
+        else:
+            self.checkpoint_times = []
+            self.cp_arrival_logged = {}
+
         self.traj_interp = {
             'x_of_t': interp1d(t_pts, x_pts, bounds_error=False, fill_value=(x_pts[0], x_pts[-1])),
             'y_of_t': interp1d(t_pts, y_pts, bounds_error=False, fill_value=(y_pts[0], y_pts[-1])),
@@ -723,6 +778,9 @@ class NMPCLeadLagNode(Node):
         U_ref_mod = np.zeros((self.nu, self.Np))
         Terrain_ref_mod = np.zeros((self.np_terrain, self.Np))
 
+        # 新增：检查点参数
+        CP_ref_mod = np.zeros((3, self.Np + 1))
+
         for i in range(self.Np + 1):
             t_i = min(t_ref_now + i * self.dt, self.t_final)
 
@@ -791,6 +849,28 @@ class NMPCLeadLagNode(Node):
                 Terrain_ref_mod[1, i] = np.clip(beta_ref, -self.max_beta_rad, self.max_beta_rad)
                 Terrain_ref_mod[2, i] = np.clip(mu_ref, self.mu_min, self.mu_max)
 
+        # 将落入当前预测域的检查点写入 CP_ref_mod
+        if self.use_checkpoint_soft_constraint and self.checkpoint_times is not None:
+            horizon_start = t_ref_now
+            horizon_end = t_ref_now + self.Np * self.dt
+
+            for t_cp in self.checkpoint_times:
+                t_cp = float(t_cp)
+
+                # 检查点不在当前预测域内，不施加约束
+                if t_cp < horizon_start or t_cp > horizon_end:
+                    continue
+
+                k_cp = int(round((t_cp - t_ref_now) / self.dt))
+                k_cp = int(np.clip(k_cp, 0, self.Np))
+
+                x_cp = float(self.traj_interp['x_of_t'](t_cp))
+                y_cp = float(self.traj_interp['y_of_t'](t_cp))
+
+                CP_ref_mod[0, k_cp] = x_cp
+                CP_ref_mod[1, k_cp] = y_cp
+                CP_ref_mod[2, k_cp] = self.cp_weight
+
         theta_for_mpc = self.theta_act
         while theta_for_mpc - theta_ref_k > math.pi:
             theta_for_mpc -= 2 * math.pi
@@ -810,6 +890,7 @@ class NMPCLeadLagNode(Node):
             X_ref_mod.flatten(order='F'),
             U_ref_mod.flatten(order='F'),
             Terrain_ref_mod.flatten(order='F'),
+            CP_ref_mod.flatten(order='F'),
             x0_dyn,
             self.u_prev
         ])
@@ -871,6 +952,28 @@ class NMPCLeadLagNode(Node):
         self.publish_scalar(self.wcmd_pub, omega_cmd)
         self.publish_scalar(self.v_sat_ratio_pub, v_sat_ratio)
         self.publish_scalar(self.w_sat_ratio_pub, w_sat_ratio)
+
+        # 记录检查点实际通过时间
+        if self.use_checkpoint_soft_constraint and self.checkpoint_times is not None:
+            for t_cp in self.checkpoint_times:
+                t_cp = float(t_cp)
+
+                if self.cp_arrival_logged.get(t_cp, None) is not None:
+                    continue
+
+                x_cp = float(self.traj_interp['x_of_t'](t_cp))
+                y_cp = float(self.traj_interp['y_of_t'](t_cp))
+                dist_cp = math.hypot(self.x_act - x_cp, self.y_act - y_cp)
+
+                if dist_cp < self.cp_arrival_radius:
+                    actual_ref_time = self.t_ref_offset + elapsed
+                    self.cp_arrival_logged[t_cp] = actual_ref_time
+                    self.get_logger().info(
+                        f"检查点通过: t_cp_ref={t_cp:.3f}s, "
+                        f"t_arrive_ref={actual_ref_time:.3f}s, "
+                        f"time_error={actual_ref_time - t_cp:.3f}s, "
+                        f"dist={dist_cp:.3f}m"
+                    )
 
         alpha_now = float(self.traj_interp['alpha_of_t'](t_ref_now))
         beta_now = float(self.traj_interp['beta_of_t'](t_ref_now))
