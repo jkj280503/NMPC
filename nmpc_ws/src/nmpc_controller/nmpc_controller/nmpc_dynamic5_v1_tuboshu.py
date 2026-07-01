@@ -19,6 +19,8 @@ class NMPCLeadLagNode(Node):
         self.dt = 0.05
         self.control_rate = 1.0 / self.dt
         self.last_path_signature = None
+        # 用于过滤重复发布的 CPS 轨迹，避免同一条轨迹反复触发重初始化
+        self.ignore_duplicate_cps_trajectory = True
 
         self.odom_sub = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         #self.path_sub = self.create_subscription(Path, '/global_path', self.path_callback, 10)
@@ -634,8 +636,6 @@ class NMPCLeadLagNode(Node):
             self.get_logger().warn("收到 CPS 轨迹，但 /odom 尚未就绪，暂不处理")
             return
 
-        self.get_logger().info("收到 CPS 经纬度时空轨迹，转换到 odom 坐标并建立时间插值...")
-
         lat_pts = np.array([p.latitude_rad for p in msg.points], dtype=float)
         lon_pts = np.array([p.longitude_rad for p in msg.points], dtype=float)
         z_raw = np.array([p.altitude_m for p in msg.points], dtype=float)
@@ -653,6 +653,39 @@ class NMPCLeadLagNode(Node):
         if len(t_pts) < 2:
             self.get_logger().warn("CPS 轨迹有效点不足，忽略")
             return
+        
+        # 1.5 过滤重复 CPS 轨迹
+        # 注意：签名必须基于原始 CPS 轨迹信息，而不是 odom 转换后的 x/y。
+        # 因为 odom 下的 x/y 会随着车辆当前位置变化而变化，同一条 GPS 轨迹重复处理时也可能得到不同 odom 坐标。
+        if self.ignore_duplicate_cps_trajectory:
+            mid_idx = len(t_pts) // 2
+
+            path_signature = (
+                len(t_pts),
+
+                round(float(t_pts[0]), 3),
+                round(float(t_pts[mid_idx]), 3),
+                round(float(t_pts[-1]), 3),
+
+                round(float(lat_pts[0]), 10),
+                round(float(lon_pts[0]), 10),
+                round(float(lat_pts[mid_idx]), 10),
+                round(float(lon_pts[mid_idx]), 10),
+                round(float(lat_pts[-1]), 10),
+                round(float(lon_pts[-1]), 10),
+
+                round(float(v_kmh[0]), 3),
+                round(float(v_kmh[mid_idx]), 3),
+                round(float(v_kmh[-1]), 3),
+            )
+
+            if self.last_path_signature == path_signature:
+                self.get_logger().info("收到重复 CPS 轨迹，忽略本次更新，不重置 NMPC")
+                return
+
+            self.last_path_signature = path_signature
+
+        self.get_logger().info("收到新的 CPS 经纬度时空轨迹，转换到 odom 坐标并建立时间插值...")
 
         # 2. 以第一点为 GPS 局部坐标原点
         self.cps_lat0 = float(lat_pts[0])
