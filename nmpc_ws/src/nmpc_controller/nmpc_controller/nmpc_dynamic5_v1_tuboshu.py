@@ -91,6 +91,19 @@ class NMPCLeadLagNode(Node):
         # 记录检查点实际到达时间，后面做实验统计
         self.cp_arrival_logged = {}
 
+        # 只约束最近一个即将到达的检查点
+        self.use_nearest_checkpoint_only = True
+
+        # 检查点进入预测域前的提前作用时间
+        # 当前 Np*dt = 1.0s，如果设置为1.5s，说明检查点还差1.5s时就开始关注
+        self.cp_lookahead_time = 1.5
+
+        # 检查点时间已经明显过去后，不再约束它，避免车辆回头追过期检查点
+        self.cp_late_tolerance = 0.30
+
+        # 当前激活的检查点时间，仅用于调试打印
+        self.active_checkpoint_time = None
+
         self.use_slope_feedforward = False
         self.ff_slope_gain = 0.0
 
@@ -922,23 +935,38 @@ class NMPCLeadLagNode(Node):
                 Terrain_ref_mod[1, i] = np.clip(beta_ref, -self.max_beta_rad, self.max_beta_rad)
                 Terrain_ref_mod[2, i] = np.clip(mu_ref, self.mu_min, self.mu_max)
 
-        # 将落入当前预测域的检查点写入 CP_ref_mod
+        # 只将最近一个即将到达的检查点写入 CP_ref_mod
         if self.use_checkpoint_soft_constraint and self.checkpoint_times is not None:
-            horizon_start = t_ref_now
             horizon_end = t_ref_now + self.Np * self.dt
 
+            active_cp = None
+
+            # 1. 先找最近一个尚未明显过期的检查点
             for t_cp in self.checkpoint_times:
                 t_cp = float(t_cp)
 
-                # 检查点不在当前预测域内，不施加约束
-                if t_cp < horizon_start or t_cp > horizon_end:
+                # 已经记录通过的检查点，不再约束
+                if self.cp_arrival_logged.get(t_cp, None) is not None:
                     continue
 
-                k_cp = int(round((t_cp - t_ref_now) / self.dt))
+                # 已经过期太久的检查点，不再强行追
+                if t_cp < t_ref_now - self.cp_late_tolerance:
+                    continue
+
+                # 只考虑未来 cp_lookahead_time 范围内的最近检查点
+                if t_cp <= t_ref_now + self.cp_lookahead_time:
+                    active_cp = t_cp
+                    break
+
+            self.active_checkpoint_time = active_cp
+
+            # 2. 只有当 active_cp 落入当前 NMPC 预测域时，才施加位置软约束
+            if active_cp is not None and active_cp <= horizon_end:
+                k_cp = int(round((active_cp - t_ref_now) / self.dt))
                 k_cp = int(np.clip(k_cp, 0, self.Np))
 
-                x_cp = float(self.traj_interp['x_of_t'](t_cp))
-                y_cp = float(self.traj_interp['y_of_t'](t_cp))
+                x_cp = float(self.traj_interp['x_of_t'](active_cp))
+                y_cp = float(self.traj_interp['y_of_t'](active_cp))
 
                 CP_ref_mod[0, k_cp] = x_cp
                 CP_ref_mod[1, k_cp] = y_cp
@@ -1048,12 +1076,14 @@ class NMPCLeadLagNode(Node):
                         f"dist={dist_cp:.3f}m"
                     )
 
+        active_cp_str = "None" if self.active_checkpoint_time is None else f"{self.active_checkpoint_time:.2f}"
         alpha_now = float(self.traj_interp['alpha_of_t'](t_ref_now))
         beta_now = float(self.traj_interp['beta_of_t'](t_ref_now))
         mu_now = float(self.traj_interp['mu_of_t'](t_ref_now))
         self.get_logger().info(
             f"Δp: {delta_p:.3f} m | time_err: {time_err:.3f} s | dv_lag: {dv_lag_base:.3f} | "
             f"t_ref: {t_ref_now:.2f}/{self.t_final:.2f} s | "
+            f"active_cp: {active_cp_str} | "
             f"alpha: {alpha_now:.3f} rad | beta: {beta_now:.3f} rad | mu: {mu_now:.2f} | "
             f"v_act: {self.v_act:.2f} | vy_act: {self.vy_act:.2f} | r_act: {self.omega_act:.2f} | "
             f"cmd_v: {v_cmd:.2f} | cmd_w: {omega_cmd:.2f} | solve={solve_ms:.1f} ms"
