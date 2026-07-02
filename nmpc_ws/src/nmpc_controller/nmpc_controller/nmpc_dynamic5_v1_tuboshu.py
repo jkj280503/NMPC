@@ -133,8 +133,34 @@ class NMPCLeadLagNode(Node):
         self.path_ready = False
         self.t_track = None         
         self.t_final = 0.0         
-        self.start_time = None    
-        self.t_ref_offset = 0.0     
+        # 初始化模式：
+        # "relative_start"：单车实验使用，轨迹 t=0 对齐到本车控制启动时刻
+        # "absolute_schedule"：多车实验使用，轨迹 t=0 对齐到统一全局调度时刻
+        self.time_init_mode = "relative_start"
+
+        # 参考时间偏移。对于时空轨迹跟踪，正常始终为 0.0
+        # 不再使用最近点初始化，所以不应该把它设成最近点时间
+        self.t_ref_offset = 0.0
+
+        # 控制器实际开始计时的 ROS time，单位 s
+        self.start_time_sec = None
+
+        # 多车绝对调度起跑时间，单位 s。
+        # 单车 relative_start 模式不用它。
+        # 多车时应由上层调度器或 launch 参数统一设置。
+        self.schedule_start_time_sec = None
+
+        # 单车实验时，允许设置一个起跑延迟，比如收到轨迹后 2s 再开始
+        self.schedule_start_delay = 0.0
+
+        # 是否要求车辆在轨迹起点附近才允许开始
+        self.init_require_start_pose = True
+
+        # 起点位置误差阈值，单位 m
+        self.init_start_pos_tol = 0.50
+
+        # 起点航向误差阈值，单位 rad
+        self.init_start_yaw_tol = 0.80
 
         self.u_prev = np.array([0.0, 0.0])
 
@@ -816,7 +842,16 @@ class NMPCLeadLagNode(Node):
                 )
 
         self.path_ready = True
+
+        # 收到新轨迹后，重新等待时间初始化
         self.is_initialized = False
+        self.start_time_sec = None
+        self.t_ref_offset = 0.0
+
+        # 如果是单车 relative_start，可以清空绝对调度时间
+        if self.time_init_mode == "relative_start":
+            self.schedule_start_time_sec = None
+
         self.u0_guess = np.zeros(self.nx * (self.Np + 1) + self.nu * self.Np)
 
         self.actual_path_msg = Path()
@@ -835,25 +870,112 @@ class NMPCLeadLagNode(Node):
             f"v_min={np.min(v_pts):.3f}m/s, v_max={np.max(v_pts):.3f}m/s"
         )
 
+    def now_sec(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def angle_diff(self, a, b):
+        return math.atan2(math.sin(a - b), math.cos(a - b))
+
+    def initialize_time_reference(self):
+        now = self.now_sec()
+
+        # 起点参考位姿
+        x0_ref = float(self.traj_interp['x_of_t'](0.0))
+        y0_ref = float(self.traj_interp['y_of_t'](0.0))
+        theta0_ref = float(self.traj_interp['theta_of_t'](0.0))
+
+        start_dist = math.hypot(self.x_act - x0_ref, self.y_act - y0_ref)
+        start_yaw_err = abs(self.angle_diff(self.theta_act, theta0_ref))
+
+        # 是否要求车辆必须在轨迹起点附近
+        if self.init_require_start_pose:
+            if start_dist > self.init_start_pos_tol or start_yaw_err > self.init_start_yaw_tol:
+                self.stop_robot()
+                self.get_logger().warn(
+                    f"等待车辆回到轨迹起点附近: "
+                    f"start_dist={start_dist:.3f}m/{self.init_start_pos_tol:.3f}m, "
+                    f"start_yaw_err={start_yaw_err:.3f}rad/{self.init_start_yaw_tol:.3f}rad"
+                )
+                return False
+
+        # 单车：相对起点初始化
+        if self.time_init_mode == "relative_start":
+            self.t_ref_offset = 0.0
+            self.start_time_sec = now + self.schedule_start_delay
+
+            self.u_prev = np.array([self.v_act, self.omega_act])
+            self.is_initialized = True
+
+            self.get_logger().info(
+                f"相对起点初始化完成: "
+                f"start_time={self.start_time_sec:.3f}s, "
+                f"t_ref_offset=0.000s, "
+                f"start_dist={start_dist:.3f}m, "
+                f"start_yaw_err={start_yaw_err:.3f}rad"
+            )
+            return True
+
+        # 多车：绝对调度时间初始化
+        elif self.time_init_mode == "absolute_schedule":
+            if self.schedule_start_time_sec is None:
+                # 这个只是单车调试兼容。
+                # 真正多车实验中，必须由上层统一设置 schedule_start_time_sec。
+                self.schedule_start_time_sec = now + self.schedule_start_delay
+                self.get_logger().warn(
+                    f"未设置 schedule_start_time_sec，临时使用 now + delay = "
+                    f"{self.schedule_start_time_sec:.3f}s。"
+                    f"多车实验中不建议这样做，必须由上层统一下发起跑时间。"
+                )
+
+            self.t_ref_offset = 0.0
+            self.start_time_sec = float(self.schedule_start_time_sec)
+
+            self.u_prev = np.array([self.v_act, self.omega_act])
+            self.is_initialized = True
+
+            self.get_logger().info(
+                f"绝对调度时间初始化完成: "
+                f"schedule_start_time={self.start_time_sec:.3f}s, "
+                f"t_ref_offset=0.000s, "
+                f"start_dist={start_dist:.3f}m, "
+                f"start_yaw_err={start_yaw_err:.3f}rad"
+            )
+            return True
+
+        else:
+            self.stop_robot()
+            self.get_logger().error(
+                f"未知 time_init_mode={self.time_init_mode}，"
+                f"必须为 relative_start 或 absolute_schedule"
+            )
+            return False
+
     def control_loop(self):
         if not self.path_ready or not self.odom_ready:
             return
 
         if not self.is_initialized:
-            dists = np.sqrt(
-                (self.traj_interp['x_of_t'](self.t_track) - self.x_act)**2 +
-                (self.traj_interp['y_of_t'](self.t_track) - self.y_act)**2
-            )
-            idx0 = np.argmin(dists)
-            self.t_ref_offset = float(self.t_track[idx0])
-            self.start_time = self.get_clock().now()
-            self.u_prev = np.array([self.v_act, self.omega_act])
-            self.is_initialized = True
-            self.get_logger().info(f"初始对齐完毕, idx0 = {idx0}, t0 = {self.t_ref_offset:.2f} s")
+            if not self.initialize_time_reference():
+                return
             return
 
-        elapsed = (self.get_clock().now() - self.start_time).nanoseconds * 1e-9
-        t_ref_now = float(np.clip(self.t_ref_offset + elapsed, 0.0, self.t_final))
+        now = self.now_sec()
+        elapsed = now - float(self.start_time_sec)
+
+        # 如果是 absolute_schedule，可能当前时间还没到统一起跑时刻
+        if elapsed < 0.0:
+            self.stop_robot()
+            self.get_logger().info(
+                f"等待统一起跑时刻: remaining={-elapsed:.3f}s",
+                throttle_duration_sec=1.0
+            )
+            return
+
+        # 实验真实参考时间，不截断，用于统计到达时间误差
+        t_exp_now = self.t_ref_offset + elapsed
+
+        # 插值用参考时间要截断，防止超过轨迹末尾导致插值异常
+        t_ref_now = float(np.clip(t_exp_now, 0.0, self.t_final))
 
         x_ref_k = float(self.traj_interp['x_of_t'](t_ref_now))
         y_ref_k = float(self.traj_interp['y_of_t'](t_ref_now))
@@ -881,17 +1003,17 @@ class NMPCLeadLagNode(Node):
         goal_dist = math.hypot(self.x_act - goal_x, self.y_act - goal_y)
 
         if self.arrival_time is None and goal_dist < 0.10:
-            self.arrival_time = elapsed
+            self.arrival_time = t_exp_now
             self.get_logger().info(
                 f"首次进入终点邻域: t_arrive={self.arrival_time:.3f}s, "
                 f"t_ref_final={self.t_final:.3f}s, "
                 f"误差={self.arrival_time - self.t_final:.3f}s"
             )
 
-        if t_ref_now >= self.t_final and goal_dist < 0.10:
+        if t_exp_now >= self.t_final and goal_dist < 0.10:
             self.stop_robot()
-            self.get_logger().info("按计划到达终点！", once=True)
-            return
+            self.get_logger().info("已到达终点并停止", once=True)
+            return  
 
         X_ref_mod = np.zeros((self.nx, self.Np + 1))
         U_ref_mod = np.zeros((self.nu, self.Np))
@@ -1100,7 +1222,7 @@ class NMPCLeadLagNode(Node):
                 dist_cp = math.hypot(self.x_act - x_cp, self.y_act - y_cp)
 
                 if dist_cp < self.cp_arrival_radius:
-                    actual_ref_time = self.t_ref_offset + elapsed
+                    actual_ref_time = t_exp_now
                     self.cp_arrival_logged[t_cp] = actual_ref_time
                     self.get_logger().info(
                         f"检查点通过: t_cp_ref={t_cp:.3f}s, "

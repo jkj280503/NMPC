@@ -151,6 +151,27 @@ nmpc_donglixue_node2.py
 将纵坡引入u_dot,侧坡引入v_dot,先只做常值坡度的拓展实现，不引入坡度预瞄，后续看效果进行修改
 
 
+切换多车模式：
+1.将初始化模式改成：
+self.time_init_mode = "absolute_schedule"
+self.schedule_start_time_sec = 同一个统一起跑时间
+2.给不同车辆remap话题：
+python3 src/nmpc_controller/nmpc_controller/nmpc_dynamic5_v1_tuboshu.py \
+  --ros-args \
+  -r /odom:=/car1/odom \
+  -r /cmd_vel:=/car1/cmd_vel \
+  -r /cps_trajectory:=/car1/cps_trajectory
+
+python3 src/nmpc_controller/nmpc_controller/nmpc_dynamic5_v1_tuboshu.py \
+  --ros-args \
+  -r /odom:=/car2/odom \
+  -r /cmd_vel:=/car2/cmd_vel \
+  -r /cps_trajectory:=/car2/cps_trajectory
+
+
+
+
+
 python3 ~/nmpc/nmpc_exp/contrast/nmpc_csv_recorder_fixed.py  --name dynamic_ll_01  --out ~/nmpc/nmpc_exp/contrast/tuboshu   --t_final 12.118867   --goal_tolerance 0.10   --auto_stop
 
 source /opt/ros/jazzy/setup.bash
@@ -191,3 +212,6 @@ done
 
 
 ros2 bag record   -o ~/nmpc/nmpc_exp/contrast/tuboshu/GPS/dynamic_open   /odom   /cmd_vel   /clock   /cps_trajectory   /nmpc_debug/e_t   /nmpc_debug/e_n   /nmpc_debug/e_theta   /nmpc_debug/t_ref   /nmpc_debug/goal_dist   /nmpc_debug/solve_ms   /nmpc_debug/v_cmd   /nmpc_debug/omega_cmd   /nmpc_debug/alpha   /nmpc_debug/beta   /nmpc_debug/mu   /nmpc_debug/vy
+
+ 
+那改为检查点时间约束的话，我这个机制是不是就相当于没有太大意义了，毕竟已经让优化器去决定了将来的速度是多少，那这样我的方法是不是就相当于大改了。这个方法是不是非常大众化，如果这样作为论文的主方法，会不会太普遍而不被接受，其次检查点时间约束方法的效果会比我现在的方法的效果更好吗
